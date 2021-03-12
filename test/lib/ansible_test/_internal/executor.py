@@ -9,7 +9,6 @@ import re
 import time
 import textwrap
 import functools
-import hashlib
 import difflib
 import filecmp
 import random
@@ -30,6 +29,7 @@ from .core_ci import (
 from .manage_ci import (
     ManageWindowsCI,
     ManageNetworkCI,
+    get_network_settings,
 )
 
 from .cloud import (
@@ -43,7 +43,6 @@ from .cloud import (
 from .io import (
     make_dirs,
     open_text_file,
-    read_binary_file,
     read_text_file,
     write_text_file,
 )
@@ -68,11 +67,12 @@ from .util import (
     open_zipfile,
     SUPPORTED_PYTHON_VERSIONS,
     str_to_version,
+    version_to_str,
+    get_hash,
 )
 
 from .util_common import (
     get_docker_completion,
-    get_network_settings,
     get_remote_completion,
     get_python_path,
     intercept_command,
@@ -90,6 +90,9 @@ from .docker_util import (
     docker_rm,
     get_docker_container_id,
     get_docker_container_ip,
+    get_docker_hostname,
+    get_docker_preferred_network_name,
+    is_docker_user_defined_network,
 )
 
 from .ansible_util import (
@@ -146,6 +149,7 @@ HTTPTESTER_HOSTS = (
     'ansible.http.tests',
     'sni1.ansible.http.tests',
     'fail.ansible.http.tests',
+    'self-signed.ansible.http.tests',
 )
 
 
@@ -182,6 +186,42 @@ def create_shell_command(command):
     return cmd
 
 
+def get_openssl_version(args, python, python_version):  # type: (EnvironmentConfig, str, str) -> t.Optional[t.Tuple[int, ...]]
+    """Return the openssl version."""
+    if not python_version.startswith('2.'):
+        # OpenSSL version checking only works on Python 3.x.
+        # This should be the most accurate, since it is the Python we will be using.
+        version = json.loads(run_command(args, [python, os.path.join(ANSIBLE_TEST_DATA_ROOT, 'sslcheck.py')], capture=True, always=True)[0])['version']
+
+        if version:
+            display.info('Detected OpenSSL version %s under Python %s.' % (version_to_str(version), python_version), verbosity=1)
+
+            return tuple(version)
+
+    # Fall back to detecting the OpenSSL version from the CLI.
+    # This should provide an adequate solution on Python 2.x.
+    openssl_path = find_executable('openssl', required=False)
+
+    if openssl_path:
+        try:
+            result = raw_command([openssl_path, 'version'], capture=True)[0]
+        except SubprocessError:
+            result = ''
+
+        match = re.search(r'^OpenSSL (?P<version>[0-9]+\.[0-9]+\.[0-9]+)', result)
+
+        if match:
+            version = str_to_version(match.group('version'))
+
+            display.info('Detected OpenSSL version %s using the openssl CLI.' % version_to_str(version), verbosity=1)
+
+            return version
+
+    display.info('Unable to detect OpenSSL version.', verbosity=1)
+
+    return None
+
+
 def get_setuptools_version(args, python):  # type: (EnvironmentConfig, str) -> t.Tuple[int]
     """Return the setuptools version for the given python."""
     try:
@@ -193,21 +233,48 @@ def get_setuptools_version(args, python):  # type: (EnvironmentConfig, str) -> t
         raise
 
 
-def get_cryptography_requirement(args, python_version):  # type: (EnvironmentConfig, str) -> str
+def install_cryptography(args, python, python_version, pip):  # type: (EnvironmentConfig, str, str, t.List[str]) -> None
+    """
+    Install cryptography for the specified environment.
+    """
+    # make sure ansible-test's basic requirements are met before continuing
+    # this is primarily to ensure that pip is new enough to facilitate further requirements installation
+    install_ansible_test_requirements(args, pip)
+
+    # make sure setuptools is available before trying to install cryptography
+    # the installed version of setuptools affects the version of cryptography to install
+    run_command(args, generate_pip_install(pip, '', packages=['setuptools']))
+
+    # install the latest cryptography version that the current requirements can support
+    # use a custom constraints file to avoid the normal constraints file overriding the chosen version of cryptography
+    # if not installed here later install commands may try to install an unsupported version due to the presence of older setuptools
+    # this is done instead of upgrading setuptools to allow tests to function with older distribution provided versions of setuptools
+    run_command(args, generate_pip_install(pip, '',
+                                           packages=[get_cryptography_requirement(args, python, python_version)],
+                                           constraints=os.path.join(ANSIBLE_TEST_DATA_ROOT, 'cryptography-constraints.txt')))
+
+
+def get_cryptography_requirement(args, python, python_version):  # type: (EnvironmentConfig, str, str) -> str
     """
     Return the correct cryptography requirement for the given python version.
-    The version of cryptograpy installed depends on the python version and setuptools version.
+    The version of cryptography installed depends on the python version, setuptools version and openssl version.
     """
-    python = find_python(python_version)
     setuptools_version = get_setuptools_version(args, python)
+    openssl_version = get_openssl_version(args, python, python_version)
 
     if setuptools_version >= (18, 5):
         if python_version == '2.6':
             # cryptography 2.2+ requires python 2.7+
             # see https://github.com/pyca/cryptography/blob/master/CHANGELOG.rst#22---2018-03-19
             cryptography = 'cryptography < 2.2'
+        elif openssl_version and openssl_version < (1, 1, 0):
+            # cryptography 3.2 requires openssl 1.1.x or later
+            # see https://cryptography.io/en/latest/changelog.html#v3-2
+            cryptography = 'cryptography < 3.2'
         else:
-            cryptography = 'cryptography'
+            # cryptography 3.4+ fails to install on many systems
+            # this is a temporary work-around until a more permanent solution is available
+            cryptography = 'cryptography < 3.4'
     else:
         # cryptography 2.1+ requires setuptools 18.5+
         # see https://github.com/pyca/cryptography/blob/62287ae18383447585606b9d0765c0f1b8a9777c/setup.py#L26
@@ -231,8 +298,6 @@ def install_command_requirements(args, python_version=None, context=None, enable
         if args.raw:
             return
 
-    generate_egg_info(args)
-
     if not args.requirements:
         return
 
@@ -250,7 +315,8 @@ def install_command_requirements(args, python_version=None, context=None, enable
     if not python_version:
         python_version = args.python_version
 
-    pip = generate_pip_command(find_python(python_version))
+    python = find_python(python_version)
+    pip = generate_pip_command(python)
 
     # skip packages which have aleady been installed for python_version
 
@@ -268,19 +334,7 @@ def install_command_requirements(args, python_version=None, context=None, enable
     installed_packages.update(packages)
 
     if args.command != 'sanity':
-        install_ansible_test_requirements(args, pip)
-
-        # make sure setuptools is available before trying to install cryptography
-        # the installed version of setuptools affects the version of cryptography to install
-        run_command(args, generate_pip_install(pip, '', packages=['setuptools']))
-
-        # install the latest cryptography version that the current requirements can support
-        # use a custom constraints file to avoid the normal constraints file overriding the chosen version of cryptography
-        # if not installed here later install commands may try to install an unsupported version due to the presence of older setuptools
-        # this is done instead of upgrading setuptools to allow tests to function with older distribution provided versions of setuptools
-        run_command(args, generate_pip_install(pip, '',
-                                               packages=[get_cryptography_requirement(args, python_version)],
-                                               constraints=os.path.join(ANSIBLE_TEST_DATA_ROOT, 'cryptography-constraints.txt')))
+        install_cryptography(args, python, python_version, pip)
 
     commands = [generate_pip_install(pip, args.command, packages=packages, context=context)]
 
@@ -378,46 +432,6 @@ def pip_list(args, pip):
     return stdout
 
 
-def generate_egg_info(args):
-    """
-    :type args: EnvironmentConfig
-    """
-    if args.explain:
-        return
-
-    ansible_version = get_ansible_version()
-
-    # inclusion of the version number in the path is optional
-    # see: https://setuptools.readthedocs.io/en/latest/formats.html#filename-embedded-metadata
-    egg_info_path = ANSIBLE_LIB_ROOT + '_base-%s.egg-info' % ansible_version
-
-    if os.path.exists(egg_info_path):
-        return
-
-    egg_info_path = ANSIBLE_LIB_ROOT + '_base.egg-info'
-
-    if os.path.exists(egg_info_path):
-        return
-
-    # minimal PKG-INFO stub following the format defined in PEP 241
-    # required for older setuptools versions to avoid a traceback when importing pkg_resources from packages like cryptography
-    # newer setuptools versions are happy with an empty directory
-    # including a stub here means we don't need to locate the existing file or have setup.py generate it when running from source
-    pkg_info = '''
-Metadata-Version: 1.0
-Name: ansible
-Version: %s
-Platform: UNKNOWN
-Summary: Radically simple IT automation
-Author-email: info@ansible.com
-License: GPLv3+
-''' % get_ansible_version()
-
-    pkg_info_path = os.path.join(egg_info_path, 'PKG-INFO')
-
-    write_text_file(pkg_info_path, pkg_info.lstrip(), create_directories=True)
-
-
 def generate_pip_install(pip, command, packages=None, constraints=None, use_constraints=True, context=None):
     """
     :type pip: list[str]
@@ -430,6 +444,7 @@ def generate_pip_install(pip, command, packages=None, constraints=None, use_cons
     """
     constraints = constraints or os.path.join(ANSIBLE_TEST_DATA_ROOT, 'requirements', 'constraints.txt')
     requirements = os.path.join(ANSIBLE_TEST_DATA_ROOT, 'requirements', '%s.txt' % ('%s.%s' % (command, context) if context else command))
+    content_constraints = None
 
     options = []
 
@@ -448,6 +463,8 @@ def generate_pip_install(pip, command, packages=None, constraints=None, use_cons
         if os.path.exists(requirements) and os.path.getsize(requirements):
             options += ['-r', requirements]
 
+        content_constraints = os.path.join(data_context().content.unit_path, 'constraints.txt')
+
     if command in ('integration', 'windows-integration', 'network-integration'):
         requirements = os.path.join(data_context().content.integration_path, 'requirements.txt')
 
@@ -459,6 +476,11 @@ def generate_pip_install(pip, command, packages=None, constraints=None, use_cons
         if os.path.exists(requirements) and os.path.getsize(requirements):
             options += ['-r', requirements]
 
+        content_constraints = os.path.join(data_context().content.integration_path, 'constraints.txt')
+
+    if command.startswith('integration.cloud.'):
+        content_constraints = os.path.join(data_context().content.integration_path, 'constraints.txt')
+
     if packages:
         options += packages
 
@@ -466,6 +488,10 @@ def generate_pip_install(pip, command, packages=None, constraints=None, use_cons
         return None
 
     if use_constraints:
+        if content_constraints and os.path.exists(content_constraints) and os.path.getsize(content_constraints):
+            # listing content constraints first gives them priority over constraints provided by ansible-test
+            options.extend(['-c', content_constraints])
+
         options.extend(['-c', constraints])
 
     return pip + ['install', '--disable-pip-version-check'] + options
@@ -557,7 +583,7 @@ def command_network_integration(args):
             time.sleep(1)
 
         remotes = [instance.wait_for_result() for instance in instances]
-        inventory = network_inventory(remotes)
+        inventory = network_inventory(args, remotes)
 
         display.info('>>> Inventory: %s\n%s' % (inventory_path, inventory.strip()), verbosity=3)
 
@@ -635,14 +661,15 @@ def network_run(args, platform, version, config):
     core_ci.load(config)
     core_ci.wait()
 
-    manage = ManageNetworkCI(core_ci)
+    manage = ManageNetworkCI(args, core_ci)
     manage.wait()
 
     return core_ci
 
 
-def network_inventory(remotes):
+def network_inventory(args, remotes):
     """
+    :type args: NetworkIntegrationConfig
     :type remotes: list[AnsibleCoreCI]
     :rtype: str
     """
@@ -656,7 +683,7 @@ def network_inventory(remotes):
             ansible_ssh_private_key_file=os.path.abspath(remote.ssh_key.key),
         )
 
-        settings = get_network_settings(remote.args, remote.platform, remote.version)
+        settings = get_network_settings(args, remote.platform, remote.version)
 
         options.update(settings.inventory_vars)
 
@@ -753,7 +780,11 @@ def command_windows_integration(args):
                 # we are running in a Docker container that is linked to the httptester container, we just need to
                 # forward these requests to the linked hostname
                 first_host = HTTPTESTER_HOSTS[0]
-                ssh_options = ["-R", "8080:%s:80" % first_host, "-R", "8443:%s:443" % first_host]
+                ssh_options = [
+                    "-R", "8080:%s:80" % first_host,
+                    "-R", "8443:%s:443" % first_host,
+                    "-R", "8444:%s:444" % first_host
+                ]
             else:
                 # we are running directly and need to start the httptester container ourselves and forward the port
                 # from there manually set so HTTPTESTER env var is set during the run
@@ -1236,16 +1267,26 @@ def start_httptester(args):
             container=80,
         ),
         dict(
+            remote=8088,
+            container=88,
+        ),
+        dict(
             remote=8443,
             container=443,
+        ),
+        dict(
+            remote=8444,
+            container=444,
+        ),
+        dict(
+            remote=8749,
+            container=749,
         ),
     ]
 
     container_id = get_docker_container_id()
 
-    if container_id:
-        display.info('Running in docker container: %s' % container_id, verbosity=1)
-    else:
+    if not container_id:
         for item in ports:
             item['localhost'] = get_available_port()
 
@@ -1257,7 +1298,7 @@ def start_httptester(args):
         container_host = get_docker_container_ip(args, httptester_id)
         display.info('Found httptester container address: %s' % container_host, verbosity=1)
     else:
-        container_host = 'localhost'
+        container_host = get_docker_hostname()
 
     ssh_options = []
 
@@ -1275,11 +1316,19 @@ def run_httptester(args, ports=None):
     """
     options = [
         '--detach',
+        '--env', 'KRB5_PASSWORD=%s' % args.httptester_krb5_password,
     ]
 
     if ports:
         for localhost_port, container_port in ports.items():
             options += ['-p', '%d:%d' % (localhost_port, container_port)]
+
+    network = get_docker_preferred_network_name(args)
+
+    if is_docker_user_defined_network(network):
+        # network-scoped aliases are only supported for containers in user defined networks
+        for alias in HTTPTESTER_HOSTS:
+            options.extend(['--network-alias', alias])
 
     httptester_id = docker_run(args, args.httptester, options=options)[0]
 
@@ -1319,7 +1368,10 @@ def inject_httptester(args):
 
         rules = '''
 rdr pass inet proto tcp from any to any port 80 -> 127.0.0.1 port 8080
+rdr pass inet proto tcp from any to any port 88 -> 127.0.0.1 port 8088
 rdr pass inet proto tcp from any to any port 443 -> 127.0.0.1 port 8443
+rdr pass inet proto tcp from any to any port 444 -> 127.0.0.1 port 8444
+rdr pass inet proto tcp from any to any port 749 -> 127.0.0.1 port 8749
 '''
         cmd = ['pfctl', '-ef', '-']
 
@@ -1331,7 +1383,10 @@ rdr pass inet proto tcp from any to any port 443 -> 127.0.0.1 port 8443
     elif iptables:
         ports = [
             (80, 8080),
+            (88, 8088),
             (443, 8443),
+            (444, 8444),
+            (749, 8749),
         ]
 
         for src, dst in ports:
@@ -1394,13 +1449,14 @@ def integration_environment(args, target, test_dir, inventory_path, ansible_conf
     if args.inject_httptester:
         env.update(dict(
             HTTPTESTER='1',
+            KRB5_PASSWORD=args.httptester_krb5_password,
         ))
 
     callback_plugins = ['junit'] + (env_config.callback_plugins or [] if env_config else [])
 
     integration = dict(
         JUNIT_OUTPUT_DIR=ResultType.JUNIT.path,
-        ANSIBLE_CALLBACK_WHITELIST=','.join(sorted(set(callback_plugins))),
+        ANSIBLE_CALLBACKS_ENABLED=','.join(sorted(set(callback_plugins))),
         ANSIBLE_TEST_CI=args.metadata.ci_provider or get_ci_provider().code,
         ANSIBLE_TEST_COVERAGE='check' if args.coverage_check else ('yes' if args.coverage else ''),
         OUTPUT_DIR=test_dir,
@@ -1927,7 +1983,7 @@ class EnvironmentDescription:
         pip_paths = dict((v, find_executable('pip%s' % v, required=False)) for v in sorted(versions))
         program_versions = dict((v, self.get_version([python_paths[v], version_check], warnings)) for v in sorted(python_paths) if python_paths[v])
         pip_interpreters = dict((v, self.get_shebang(pip_paths[v])) for v in sorted(pip_paths) if pip_paths[v])
-        known_hosts_hash = self.get_hash(os.path.expanduser('~/.ssh/known_hosts'))
+        known_hosts_hash = get_hash(os.path.expanduser('~/.ssh/known_hosts'))
 
         for version in sorted(versions):
             self.check_python_pip_association(version, python_paths, pip_paths, pip_interpreters, warnings)
@@ -1958,16 +2014,8 @@ class EnvironmentDescription:
         pip_path = pip_paths.get(version)
         python_path = python_paths.get(version)
 
-        if not python_path and not pip_path:
-            # neither python or pip is present for this version
-            return
-
-        if not python_path:
-            warnings.append('A %s interpreter was not found, yet a matching pip was found at "%s".' % (python_label, pip_path))
-            return
-
-        if not pip_path:
-            warnings.append('A %s interpreter was found at "%s", yet a matching pip was not found.' % (python_label, python_path))
+        if not python_path or not pip_path:
+            # skip checks when either python or pip are missing for this version
             return
 
         pip_shebang = pip_interpreters.get(version)
@@ -2074,21 +2122,6 @@ class EnvironmentDescription:
         """
         with open_text_file(path) as script_fd:
             return script_fd.readline().strip()
-
-    @staticmethod
-    def get_hash(path):
-        """
-        :type path: str
-        :rtype: str | None
-        """
-        if not os.path.exists(path):
-            return None
-
-        file_hash = hashlib.md5()
-
-        file_hash.update(read_binary_file(path))
-
-        return file_hash.hexdigest()
 
 
 class NoChangesDetected(ApplicationWarning):

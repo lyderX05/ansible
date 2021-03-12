@@ -248,7 +248,7 @@ class CallbackBase(AnsiblePlugin):
         ''' removes data from results for display '''
 
         # mostly controls that debug only outputs what it was meant to
-        if task_name == 'debug':
+        if task_name in C._ACTION_DEBUG:
             if 'msg' in result:
                 # msg should be alone
                 for key in list(result.keys()):
@@ -258,6 +258,11 @@ class CallbackBase(AnsiblePlugin):
                 # 'var' value as field, so eliminate others and what is left should be varname
                 for hidme in self._hide_in_debug:
                     result.pop(hidme, None)
+
+    def _print_task_path(self, task, color=C.COLOR_DEBUG):
+        path = task.get_path()
+        if path:
+            self._display.display(u"task path: %s" % path, color=color)
 
     def set_play_context(self, play_context):
         pass

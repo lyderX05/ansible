@@ -25,6 +25,19 @@ Most programming languages have loops (``for``, ``while``, and so on) and list c
 - selectattr/rejectattr: very similar to the above but it uses a specific attribute of the list elements for the conditional statement.
 
 
+.. _exponential_backoff:
+
+Use a loop to create exponential backoff for retries/until.
+
+.. code-block:: yaml
+
+    - name: retry ping 10 times with exponential backup delay
+      ping:
+      retries: 10
+      delay: '{{item|int}}'
+      loop: '{{ range(1, 10)|map('pow', 2) }}'
+
+
 .. _keys_from_dict_matching_list:
 
 Extract keys from a dictionary matching elements from a list
@@ -47,7 +60,8 @@ There are several ways to do it in Ansible, this is just one example:
 
   tasks:
     - name: Show extracted list of keys from a list of dictionaries
-      debug: msg="{{ chains | map('extract', chains_config) | map(attribute='configs') | flatten | map(attribute='type') | flatten }}"
+      ansible.builtin.debug:
+        msg: "{{ chains | map('extract', chains_config) | map(attribute='configs') | flatten | map(attribute='type') | flatten }}"
       vars:
         chains: [1, 2]
         chains_config:
@@ -80,6 +94,13 @@ There are several ways to do it in Ansible, this is just one example:
     }
 
 
+.. code-block:: YAML+Jinja
+ :caption: Get the unique list of values of a variable that vary per host
+
+    vars:
+        unique_value_list: "{{ groups['all'] | map ('extract', hostvars, 'varname') | list | unique}}"
+
+
 .. _find_mount_point:
 
 Find mount point
@@ -97,7 +118,8 @@ In this case, we want to find the mount point for a given path across our machin
         path: /var/lib/cache
      tasks:
      - name: The mount point for {{path}}, found using the Ansible mount facts, [-1] is the same as the 'last' filter
-       debug: msg="{{(ansible_facts.mounts | selectattr('mount', 'in', path) | list | sort(attribute='mount'))[-1]['mount']}}"
+       ansible.builtin.debug:
+        msg: "{{(ansible_facts.mounts | selectattr('mount', 'in', path) | list | sort(attribute='mount'))[-1]['mount']}}"
 
 
 
@@ -110,8 +132,8 @@ The special ``omit`` variable ONLY works with module options, but we can still u
  :caption: Inline list filtering when feeding a module option
  :emphasize-lines: 3, 7
 
-    - name: enable a list of Windows features, by name
-      set_fact:
+    - name: Enable a list of Windows features, by name
+      ansible.builtin.set_fact:
         win_feature_list: "{{ namestuff | reject('equalto', omit) | list }}"
       vars:
         namestuff:
@@ -126,8 +148,8 @@ Another way is to avoid adding elements to the list in the first place, so you c
  :caption: Using set_fact in a loop to increment a list conditionally
  :emphasize-lines: 3, 4, 6
 
-    - name: build unique list with some items conditionally omittted
-      set_fact:
+    - name: Build unique list with some items conditionally omitted
+      ansible.builtin.set_fact:
          namestuff: ' {{ (namestuff | default([])) | union([item]) }}'
       when: item != omit
       loop:
@@ -136,7 +158,30 @@ Another way is to avoid adding elements to the list in the first place, so you c
           - "bar"
 
 
-.. _complex_type_transfomations:
+Custom Fileglob Based on a Variable
+-----------------------------------
+
+This example uses `Python argument list unpacking <https://docs.python.org/3/tutorial/controlflow.html#unpacking-argument-lists>`_ to create a custom list of fileglobs based on a variable.
+
+.. code-block:: YAML+Jinja
+  :caption: Using fileglob with a list based on a variable.
+
+    - hosts: all
+      vars:
+        mygroups
+          - prod
+          - web
+      tasks:
+        - name: Copy a glob of files based on a list of groups
+          copy:
+            src: "{{ item }}"
+            dest: "/tmp/{{ item }}"
+          loop: '{{ q("fileglob", *globlist) }}'
+          vars:
+            globlist: '{{ mygroups | map("regex_replace", "^(.*)$", "files/\1/*.conf") | list }}'
+
+
+.. _complex_type_transformations:
 
 Complex Type transformations
 =============================
@@ -160,7 +205,7 @@ These example produces ``{"a": "b", "c": "d"}``
 
   vars:
       single_list: [ 'a', 'b', 'c', 'd' ]
-      mydict: "{{ dict(single_list) | slice(2) | list }}"
+      mydict: "{{ dict(single_list | slice(2) | list) }}"
 
 
 .. code-block:: YAML+Jinja
@@ -181,7 +226,7 @@ A bit more complex, using ``set_fact`` and a ``loop`` to create/update a diction
  :emphasize-lines: 3, 4
 
      - name: Uses 'combine' to update the dictionary and 'zip' to make pairs of both lists
-       set_fact:
+       ansible.builtin.set_fact:
          mydict: "{{ mydict | default({}) | combine({item[0]: item[1]}) }}"
        loop: "{{ (keys | zip(values)) | list }}"
        vars:
@@ -229,7 +274,8 @@ https://www.reddit.com/r/ansible/comments/gj5a93/trying_to_get_uptime_from_secon
 
 .. code-block:: YAML+Jinja
 
- - debug:
+ - name: Show the uptime in a certain format
+   ansible.builtin.debug:
     msg: Timedelta {{ now() - now().fromtimestamp(now(fmt='%s') | int - ansible_uptime_seconds) }}
 
 
@@ -239,5 +285,5 @@ https://www.reddit.com/r/ansible/comments/gj5a93/trying_to_get_uptime_from_secon
        Jinja2 filters included with Ansible
    :doc:`playbooks_tests`
        Jinja2 tests included with Ansible
-   `Jinja2 Docs <http://jinja.pocoo.org/docs/>`_
+   `Jinja2 Docs <https://jinja.palletsprojects.com/>`_
       Jinja2 documentation, includes lists for core filters and tests

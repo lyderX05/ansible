@@ -11,6 +11,14 @@ from ansible.module_utils.basic import AnsibleModule
 def main():
     module = AnsibleModule(
         {
+            'required': {
+                'required': True,
+            },
+            'required_one_of_one': {},
+            'required_one_of_two': {},
+            'required_by_one': {},
+            'required_by_two': {},
+            'required_by_three': {},
             'state': {
                 'type': 'str',
                 'choices': ['absent', 'present'],
@@ -20,6 +28,104 @@ def main():
             'mapping': {
                 'type': 'dict',
             },
+            'required_one_of': {
+                'required_one_of': [['thing', 'other']],
+                'type': 'list',
+                'elements': 'dict',
+                'options': {
+                    'thing': {},
+                    'other': {},
+                },
+            },
+            'required_by': {
+                'required_by': {'thing': 'other'},
+                'type': 'list',
+                'elements': 'dict',
+                'options': {
+                    'thing': {},
+                    'other': {},
+                },
+            },
+            'required_together': {
+                'required_together': [['thing', 'other']],
+                'type': 'list',
+                'elements': 'dict',
+                'options': {
+                    'thing': {},
+                    'other': {},
+                    'another': {},
+                },
+            },
+            'required_if': {
+                'required_if': (
+                    ('thing', 'foo', ('other',), True),
+                ),
+                'type': 'list',
+                'elements': 'dict',
+                'options': {
+                    'thing': {},
+                    'other': {},
+                    'another': {},
+                },
+            },
+            'json': {
+                'type': 'json',
+            },
+            'fail_on_missing_params': {
+                'type': 'list',
+                'default': [],
+            },
+            'needed_param': {},
+            'required_together_one': {},
+            'required_together_two': {},
+            'suboptions_list_no_elements': {
+                'type': 'list',
+                'options': {
+                    'thing': {},
+                },
+            },
+            'choices_with_strings_like_bools': {
+                'type': 'str',
+                'choices': [
+                    'on',
+                    'off',
+                ],
+            },
+            'choices': {
+                'type': 'str',
+                'choices': [
+                    'foo',
+                    'bar',
+                ],
+            },
+            'list_choices': {
+                'type': 'list',
+                'choices': [
+                    'foo',
+                    'bar',
+                    'baz',
+                ],
+            },
+            'primary': {
+                'type': 'str',
+                'aliases': [
+                    'alias',
+                ],
+            },
+            'password': {
+                'type': 'str',
+                'no_log': True,
+            },
+            'not_a_password': {
+                'type': 'str',
+                'no_log': False,
+            },
+            'maybe_password': {
+                'type': 'str',
+            },
+            'int': {
+                'type': 'int',
+            },
         },
         required_if=(
             ('state', 'present', ('path', 'content'), True),
@@ -27,7 +133,18 @@ def main():
         mutually_exclusive=(
             ('path', 'content'),
         ),
+        required_one_of=(
+            ('required_one_of_one', 'required_one_of_two'),
+        ),
+        required_by={
+            'required_by_one': ('required_by_two', 'required_by_three'),
+        },
+        required_together=(
+            ('required_together_one', 'required_together_two'),
+        ),
     )
+
+    module.fail_on_missing_params(module.params['fail_on_missing_params'])
 
     module.exit_json(**module.params)
 

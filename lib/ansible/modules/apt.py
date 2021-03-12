@@ -36,9 +36,9 @@ options:
   update_cache:
     description:
       - Run the equivalent of C(apt-get update) before the operation. Can be run as part of the package installation or as a separate step.
+      - Default is not to update the cache.
     aliases: [ update-cache ]
     type: bool
-    default: 'no'
   update_cache_retries:
     description:
       - Amount of retries if the cache update fails. Also see I(update_cache_retry_max_delay).
@@ -53,7 +53,7 @@ options:
     version_added: '2.10'
   cache_valid_time:
     description:
-      - Update the apt cache if its older than the I(cache_valid_time). This option is set in seconds.
+      - Update the apt cache if it is older than the I(cache_valid_time). This option is set in seconds.
       - As of Ansible 2.4, if explicitly set, this sets I(update_cache=yes).
     type: int
     default: 0
@@ -133,7 +133,7 @@ options:
     description:
       - Force the exit code of /usr/sbin/policy-rc.d.
       - For example, if I(policy_rc_d=101) the installed package will not trigger a service start.
-      - If /usr/sbin/policy-rc.d already exist, it is backed up and restored after the package installation.
+      - If /usr/sbin/policy-rc.d already exists, it is backed up and restored after the package installation.
       - If C(null), the /usr/sbin/policy-rc.d isn't created/changed.
     type: int
     default: null
@@ -268,6 +268,17 @@ EXAMPLES = '''
   apt:
     autoremove: yes
 
+# Sometimes apt tasks fail because apt is locked by an autoupdate or by a race condition on a thread.
+# To check for a lock file before executing, and keep trying until the lock file is released:
+- name: Install packages only when the apt process is not locked
+  apt:
+    name: foo
+    state: present
+  register: apt_action
+  retries: 100
+  until: apt_action is success or ('Failed to lock apt for exclusive operation' not in apt_action.msg and '/var/lib/dpkg/lock' not in apt_action.msg)
+
+
 '''
 
 RETURN = '''
@@ -310,7 +321,9 @@ import random
 import time
 
 from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.common.respawn import has_respawned, probe_interpreters_for_module, respawn_module
 from ansible.module_utils._text import to_bytes, to_native
+from ansible.module_utils.six import PY3
 from ansible.module_utils.urls import fetch_file
 
 # APT related constants
@@ -339,18 +352,16 @@ CLEAN_OP_CHANGED_STR = dict(
     autoclean='Del ',
 )
 
-HAS_PYTHON_APT = True
+apt = apt_pkg = None  # keep pylint happy by declaring unconditionally
+
+HAS_PYTHON_APT = False
 try:
     import apt
     import apt.debfile
     import apt_pkg
+    HAS_PYTHON_APT = True
 except ImportError:
-    HAS_PYTHON_APT = False
-
-if sys.version_info[0] < 3:
-    PYTHON_APT = 'python-apt'
-else:
-    PYTHON_APT = 'python3-apt'
+    pass
 
 
 class PolicyRcD(object):
@@ -369,7 +380,7 @@ class PolicyRcD(object):
         if self.m.params['policy_rc_d'] is None:
             return
 
-        # if the /usr/sbin/policy-rc.d already exist
+        # if the /usr/sbin/policy-rc.d already exists
         # we will back it up during package installation
         # then restore it
         if os.path.exists('/usr/sbin/policy-rc.d'):
@@ -379,21 +390,21 @@ class PolicyRcD(object):
 
     def __enter__(self):
         """
-        This method will be call when we enter the context, before we call `apt-get …`
+        This method will be called when we enter the context, before we call `apt-get …`
         """
 
         # if policy_rc_d is null then we don't need to modify policy-rc.d
         if self.m.params['policy_rc_d'] is None:
             return
 
-        # if the /usr/sbin/policy-rc.d already exist we back it up
+        # if the /usr/sbin/policy-rc.d already exists we back it up
         if self.backup_dir:
             try:
                 shutil.move('/usr/sbin/policy-rc.d', self.backup_dir)
             except Exception:
                 self.m.fail_json(msg="Fail to move /usr/sbin/policy-rc.d to %s" % self.backup_dir)
 
-        # we write /usr/sbin/policy-rc.d so it always exit with code policy_rc_d
+        # we write /usr/sbin/policy-rc.d so it always exits with code policy_rc_d
         try:
             with open('/usr/sbin/policy-rc.d', 'w') as policy_rc_d:
                 policy_rc_d.write('#!/bin/sh\nexit %d\n' % self.m.params['policy_rc_d'])
@@ -404,7 +415,7 @@ class PolicyRcD(object):
 
     def __exit__(self, type, value, traceback):
         """
-        This method will be call when we enter the context, before we call `apt-get …`
+        This method will be called when we enter the context, before we call `apt-get …`
         """
 
         # if policy_rc_d is null then we don't need to modify policy-rc.d
@@ -422,7 +433,7 @@ class PolicyRcD(object):
                 self.m.fail_json(msg="Fail to move back %s to /usr/sbin/policy-rc.d"
                                      % os.path.join(self.backup_dir, 'policy-rc.d'))
         else:
-            # if they wheren't any /usr/sbin/policy-rc.d file before the call to __enter__
+            # if there wasn't a /usr/sbin/policy-rc.d file before the call to __enter__
             # we just remove the file
             try:
                 os.remove('/usr/sbin/policy-rc.d')
@@ -1077,26 +1088,59 @@ def main():
     module.run_command_environ_update = APT_ENV_VARS
 
     if not HAS_PYTHON_APT:
+        # This interpreter can't see the apt Python library- we'll do the following to try and fix that:
+        # 1) look in common locations for system-owned interpreters that can see it; if we find one, respawn under it
+        # 2) finding none, try to install a matching python-apt package for the current interpreter version;
+        #    we limit to the current interpreter version to try and avoid installing a whole other Python just
+        #    for apt support
+        # 3) if we installed a support package, try to respawn under what we think is the right interpreter (could be
+        #    the current interpreter again, but we'll let it respawn anyway for simplicity)
+        # 4) if still not working, return an error and give up (some corner cases not covered, but this shouldn't be
+        #    made any more complex than it already is to try and cover more, eg, custom interpreters taking over
+        #    system locations)
+
+        apt_pkg_name = 'python3-apt' if PY3 else 'python-apt'
+
+        if has_respawned():
+            # this shouldn't be possible; short-circuit early if it happens...
+            module.fail_json(msg="{0} must be installed and visible from {1}.".format(apt_pkg_name, sys.executable))
+
+        interpreters = ['/usr/bin/python3', '/usr/bin/python2', '/usr/bin/python']
+
+        interpreter = probe_interpreters_for_module(interpreters, 'apt')
+
+        if interpreter:
+            # found the Python bindings; respawn this module under the interpreter where we found them
+            respawn_module(interpreter)
+            # this is the end of the line for this process, it will exit here once the respawned module has completed
+
+        # don't make changes if we're in check_mode
         if module.check_mode:
             module.fail_json(msg="%s must be installed to use check mode. "
-                                 "If run normally this module can auto-install it." % PYTHON_APT)
-        try:
-            # We skip cache update in auto install the dependency if the
-            # user explicitly declared it with update_cache=no.
-            if module.params.get('update_cache') is False:
-                module.warn("Auto-installing missing dependency without updating cache: %s" % PYTHON_APT)
-            else:
-                module.warn("Updating cache and auto-installing missing dependency: %s" % PYTHON_APT)
-                module.run_command(['apt-get', 'update'], check_rc=True)
+                                 "If run normally this module can auto-install it." % apt_pkg_name)
 
-            module.run_command(['apt-get', 'install', '--no-install-recommends', PYTHON_APT, '-y', '-q'], check_rc=True)
-            global apt, apt_pkg
-            import apt
-            import apt.debfile
-            import apt_pkg
-        except ImportError:
-            module.fail_json(msg="Could not import python modules: apt, apt_pkg. "
-                                 "Please install %s package." % PYTHON_APT)
+        # We skip cache update in auto install the dependency if the
+        # user explicitly declared it with update_cache=no.
+        if module.params.get('update_cache') is False:
+            module.warn("Auto-installing missing dependency without updating cache: %s" % apt_pkg_name)
+        else:
+            module.warn("Updating cache and auto-installing missing dependency: %s" % apt_pkg_name)
+            module.run_command(['apt-get', 'update'], check_rc=True)
+
+        # try to install the apt Python binding
+        module.run_command(['apt-get', 'install', '--no-install-recommends', apt_pkg_name, '-y', '-q'], check_rc=True)
+
+        # try again to find the bindings in common places
+        interpreter = probe_interpreters_for_module(interpreters, 'apt')
+
+        if interpreter:
+            # found the Python bindings; respawn this module under the interpreter where we found them
+            # NB: respawn is somewhat wasteful if it's this interpreter, but simplifies the code
+            respawn_module(interpreter)
+            # this is the end of the line for this process, it will exit here once the respawned module has completed
+        else:
+            # we've done all we can do; just tell the user it's busted and get out
+            module.fail_json(msg="{0} must be installed and visible from {1}.".format(apt_pkg_name, sys.executable))
 
     global APTITUDE_CMD
     APTITUDE_CMD = module.get_bin_path("aptitude", False)

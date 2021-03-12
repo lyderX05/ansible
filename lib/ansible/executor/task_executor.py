@@ -214,7 +214,7 @@ class TaskExecutor:
         if self._loader.get_basedir() not in self._job_vars['ansible_search_path']:
             self._job_vars['ansible_search_path'].append(self._loader.get_basedir())
 
-        templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=self._job_vars)
+        templar = Templar(loader=self._loader, variables=self._job_vars)
         items = None
         loop_cache = self._job_vars.get('_ansible_loop_cache')
         if loop_cache is not None:
@@ -277,7 +277,7 @@ class TaskExecutor:
         label = None
         loop_pause = 0
         extended = False
-        templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=self._job_vars)
+        templar = Templar(loader=self._loader, variables=self._job_vars)
 
         # FIXME: move this to the object itself to allow post_validate to take care of templating (loop_control.post_validate)
         if self._task.loop_control:
@@ -419,7 +419,7 @@ class TaskExecutor:
         if variables is None:
             variables = self._job_vars
 
-        templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=variables)
+        templar = Templar(loader=self._loader, variables=variables)
 
         context_validation_error = None
         try:
@@ -477,7 +477,7 @@ class TaskExecutor:
 
         # if this task is a TaskInclude, we just return now with a success code so the
         # main thread can expand the task list for the given host
-        if self._task.action in ('include', 'include_tasks'):
+        if self._task.action in C._ACTION_ALL_INCLUDE_TASKS:
             include_args = self._task.args.copy()
             include_file = include_args.pop('_raw_params', None)
             if not include_file:
@@ -487,7 +487,7 @@ class TaskExecutor:
             return dict(include=include_file, include_args=include_args)
 
         # if this task is a IncludeRole, we just return now with a success code so the main thread can expand the task list for the given host
-        elif self._task.action == 'include_role':
+        elif self._task.action in C._ACTION_INCLUDE_ROLE:
             include_args = self._task.args.copy()
             return dict(include_args=include_args)
 
@@ -624,7 +624,7 @@ class TaskExecutor:
                 return failed_when_result
 
             if 'ansible_facts' in result:
-                if self._task.action in ('set_fact', 'include_vars'):
+                if self._task.action in C._ACTION_WITH_CLEAN_FACTS:
                     vars_copy.update(result['ansible_facts'])
                 else:
                     # TODO: cleaning of facts should eventually become part of taskresults instead of vars
@@ -688,7 +688,7 @@ class TaskExecutor:
             variables[self._task.register] = result = wrap_var(result)
 
         if 'ansible_facts' in result:
-            if self._task.action in ('set_fact', 'include_vars'):
+            if self._task.action in C._ACTION_WITH_CLEAN_FACTS:
                 variables.update(result['ansible_facts'])
             else:
                 # TODO: cleaning of facts should eventually become part of taskresults instead of vars
@@ -738,7 +738,7 @@ class TaskExecutor:
         # we need the 'normal' action handler for the status check, so get it
         # now via the action_loader
         async_handler = self._shared_loader_obj.action_loader.get(
-            'async_status',
+            'ansible.legacy.async_status',
             task=async_task,
             connection=self._connection,
             play_context=self._play_context,
@@ -795,6 +795,28 @@ class TaskExecutor:
             else:
                 return dict(failed=True, msg="async task produced unparseable results", async_result=async_result)
         else:
+            # If the async task finished, automatically cleanup the temporary
+            # status file left behind.
+            cleanup_task = Task().load(
+                {
+                    'async_status': {
+                        'jid': async_jid,
+                        'mode': 'cleanup',
+                    },
+                    'environment': self._task.environment,
+                }
+            )
+            cleanup_handler = self._shared_loader_obj.action_loader.get(
+                'ansible.legacy.async_status',
+                task=cleanup_task,
+                connection=self._connection,
+                play_context=self._play_context,
+                loader=self._loader,
+                templar=templar,
+                shared_loader_obj=self._shared_loader_obj,
+            )
+            cleanup_handler.run(task_vars=task_vars)
+            cleanup_handler.cleanup(force=True)
             async_handler.cleanup(force=True)
             return async_result
 
@@ -990,6 +1012,9 @@ class TaskExecutor:
             handler_name = self._task.action
         elif all((module_prefix in C.NETWORK_GROUP_MODULES, self._shared_loader_obj.action_loader.has_plugin(network_action, collection_list=collections))):
             handler_name = network_action
+            display.vvvv("Using network group action {handler} for {action}".format(handler=handler_name,
+                                                                                    action=self._task.action),
+                         host=self._play_context.remote_addr)
         else:
             # use ansible.legacy.normal to allow (historic) local action_plugins/ override without collections search
             handler_name = 'ansible.legacy.normal'
@@ -1017,7 +1042,7 @@ def start_connection(play_context, variables, task_uuid):
     Starts the persistent connection
     '''
     candidate_paths = [C.ANSIBLE_CONNECTION_PATH or os.path.dirname(sys.argv[0])]
-    candidate_paths.extend(os.environ['PATH'].split(os.pathsep))
+    candidate_paths.extend(os.environ.get('PATH', '').split(os.pathsep))
     for dirname in candidate_paths:
         ansible_connection = os.path.join(dirname, 'ansible-connection')
         if os.path.isfile(ansible_connection):

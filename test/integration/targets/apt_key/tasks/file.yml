@@ -3,6 +3,11 @@
     url: https://getfedora.org/static/fedora.gpg
     dest: /tmp/fedora.gpg
 
+- name: Ensure clean slate
+  apt_key:
+    id: 49FD77499570FF31
+    state: absent
+
 - name: Run apt_key with both file and keyserver
   apt_key:
     file: /tmp/fedora.gpg
@@ -28,3 +33,20 @@
       - 'both_file_keyserver is failed'
       - 'only_file.changed'
       - 'not only_keyserver.changed'
+
+- name: remove fedora.gpg
+  apt_key:
+    id: 49FD77499570FF31
+    state: absent
+  register: remove_fedora
+
+- name: add key from url
+  apt_key:
+    url: https://getfedora.org/static/fedora.gpg
+  register: apt_key_url
+
+- name: verify key from url
+  assert:
+    that:
+      - remove_fedora is changed
+      - apt_key_url is changed

@@ -7,13 +7,15 @@ __metaclass__ = type
 
 DOCUMENTATION = """
     author: Ansible Core Team
-    connection: winrm
+    name: winrm
     short_description: Run tasks over Microsoft's WinRM
     description:
         - Run commands or put/fetch on a target via WinRM
         - This plugin allows extra arguments to be passed that are supported by the protocol but not explicitly defined here.
           They should take the form of variables declared with the following pattern `ansible_winrm_<option>`.
     version_added: "2.0"
+    extends_documentation_fragment:
+        - connection_pipelining
     requirements:
         - pywinrm (python library)
     options:
@@ -534,6 +536,8 @@ class Connection(ConnectionBase):
         return self
 
     def reset(self):
+        if not self._connected:
+            return
         self.protocol = None
         self.shell_id = None
         self._connect()

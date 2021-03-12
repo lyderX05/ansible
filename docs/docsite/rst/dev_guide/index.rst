@@ -4,6 +4,12 @@
 Developer Guide
 ***************
 
+.. note::
+
+    **Making Open Source More Inclusive**
+
+    Red Hat is committed to replacing problematic language in our code, documentation, and web properties. We are beginning with these four terms: master, slave, blacklist, and whitelist. We ask that you open an issue or pull request if you come upon a term that we have missed. For more details, see `our CTO Chris Wright's message <https://www.redhat.com/en/blog/making-open-source-more-inclusive-eradicating-problematic-language>`_.
+
 Welcome to the Ansible Developer Guide!
 
 **Who should use this guide?**
@@ -18,6 +24,7 @@ Find the task that best describes what you want to do:
    * I want to figure out if :ref:`developing a module is the right approach <module_dev_should_you>` for my use case.
    * I want to :ref:`develop a collection <developing_collections>`.
    * I want to :ref:`contribute to an Ansible-maintained collection <contributing_maintained_collections>`.
+   * I want to :ref:`contribute to a community-maintained collection <hacking_collections>`.
    * I want to :ref:`migrate a role to a collection <migrating_roles>`.
 
 * I've read the info above, and I'm sure I want to develop a module:

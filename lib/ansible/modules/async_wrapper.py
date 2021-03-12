@@ -8,6 +8,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 
+import errno
 import json
 import shlex
 import shutil
@@ -20,7 +21,7 @@ import time
 import syslog
 import multiprocessing
 
-from ansible.module_utils._text import to_text
+from ansible.module_utils._text import to_text, to_bytes
 
 PY3 = sys.version_info[0] == 3
 
@@ -73,7 +74,7 @@ def _filter_non_json_lines(data):
     Used to filter unrelated output around module JSON output, like messages from
     tcagetattr, or where dropbear spews MOTD on every single command (which is nuts).
 
-    Filters leading lines before first line-starting occurrence of '{' or '[', and filter all
+    Filters leading lines before first line-starting occurrence of '{', and filter all
     trailing lines after matching close character (working from the bottom of output).
     '''
     warnings = []
@@ -84,10 +85,6 @@ def _filter_non_json_lines(data):
     for start, line in enumerate(lines):
         line = line.strip()
         if line.startswith(u'{'):
-            endchar = u'}'
-            break
-        elif line.startswith(u'['):
-            endchar = u']'
             break
     else:
         raise ValueError('No start of json char found')
@@ -96,7 +93,7 @@ def _filter_non_json_lines(data):
     lines = lines[start:]
 
     for reverse_end_offset, line in enumerate(reversed(lines)):
-        if line.strip().endswith(endchar):
+        if line.strip().endswith(u'}'):
             break
     else:
         raise ValueError('No end of json char found')
@@ -113,14 +110,20 @@ def _filter_non_json_lines(data):
 
 
 def _get_interpreter(module_path):
-    module_fd = open(module_path, 'rb')
-    try:
+    with open(module_path, 'rb') as module_fd:
         head = module_fd.read(1024)
-        if head[0:2] != '#!':
+        if head[0:2] != b'#!':
             return None
-        return head[2:head.index('\n')].strip().split(' ')
-    finally:
-        module_fd.close()
+        return head[2:head.index(b'\n')].strip().split(b' ')
+
+
+def _make_temp_dir(path):
+    # TODO: Add checks for permissions on path.
+    try:
+        os.makedirs(path)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
 
 
 def _run_module(wrapped_cmd, jid, job_path):
@@ -142,7 +145,7 @@ def _run_module(wrapped_cmd, jid, job_path):
     filtered_outdata = ''
     stderr = ''
     try:
-        cmd = shlex.split(wrapped_cmd)
+        cmd = [to_bytes(c, errors='surrogate_or_strict') for c in shlex.split(wrapped_cmd)]
         # call the module interpreter directly (for non-binary modules)
         # this permits use of a script for an interpreter on non-Linux platforms
         interpreter = _get_interpreter(cmd[0])
@@ -231,14 +234,16 @@ def main():
     jobdir = os.path.expanduser(async_dir)
     job_path = os.path.join(jobdir, jid)
 
-    if not os.path.exists(jobdir):
-        try:
-            os.makedirs(jobdir)
-        except Exception:
-            print(json.dumps({
-                "failed": 1,
-                "msg": "could not create: %s" % jobdir
-            }))
+    try:
+        _make_temp_dir(jobdir)
+    except Exception as e:
+        print(json.dumps({
+            "failed": 1,
+            "msg": "could not create: %s - %s" % (jobdir, to_text(e)),
+            "exception": to_text(traceback.format_exc()),
+        }))
+        sys.exit(1)
+
     # immediately exit this process, leaving an orphaned process
     # running which immediately forks a supervisory timing process
 

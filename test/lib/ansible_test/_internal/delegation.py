@@ -11,6 +11,7 @@ from . import types as t
 
 from .io import (
     make_dirs,
+    read_text_file,
 )
 
 from .executor import (
@@ -36,11 +37,13 @@ from .config import (
 
 from .core_ci import (
     AnsibleCoreCI,
+    SshKey,
 )
 
 from .manage_ci import (
     ManagePosixCI,
     ManageWindowsCI,
+    get_ssh_key_setup,
 )
 
 from .util import (
@@ -72,6 +75,9 @@ from .docker_util import (
     docker_available,
     docker_network_disconnect,
     get_docker_networks,
+    get_docker_preferred_network_name,
+    get_docker_hostname,
+    is_docker_user_defined_network,
 )
 
 from .cloud import (
@@ -305,14 +311,18 @@ def delegate_docker(args, exclude, require, integration_targets):
             if args.docker_seccomp != 'default':
                 test_options += ['--security-opt', 'seccomp=%s' % args.docker_seccomp]
 
-            if os.path.exists(docker_socket):
+            if get_docker_hostname() != 'localhost' or os.path.exists(docker_socket):
                 test_options += ['--volume', '%s:%s' % (docker_socket, docker_socket)]
 
             if httptester_id:
-                test_options += ['--env', 'HTTPTESTER=1']
+                test_options += ['--env', 'HTTPTESTER=1', '--env', 'KRB5_PASSWORD=%s' % args.httptester_krb5_password]
 
-                for host in HTTPTESTER_HOSTS:
-                    test_options += ['--link', '%s:%s' % (httptester_id, host)]
+                network = get_docker_preferred_network_name(args)
+
+                if not is_docker_user_defined_network(network):
+                    # legacy links are required when using the default bridge network instead of user-defined networks
+                    for host in HTTPTESTER_HOSTS:
+                        test_options += ['--link', '%s:%s' % (httptester_id, host)]
 
             if isinstance(args, IntegrationConfig):
                 cloud_platforms = get_cloud_providers(args)
@@ -327,9 +337,16 @@ def delegate_docker(args, exclude, require, integration_targets):
             else:
                 test_id = test_id.strip()
 
+            setup_sh = read_text_file(os.path.join(ANSIBLE_TEST_DATA_ROOT, 'setup', 'docker.sh'))
+
+            ssh_keys_sh = get_ssh_key_setup(SshKey(args))
+
+            setup_sh += ssh_keys_sh
+            shell = setup_sh.splitlines()[0][2:]
+
+            docker_exec(args, test_id, [shell], data=setup_sh)
+
             # write temporary files to /root since /tmp isn't ready immediately on container start
-            docker_put(args, test_id, os.path.join(ANSIBLE_TEST_DATA_ROOT, 'setup', 'docker.sh'), '/root/docker.sh')
-            docker_exec(args, test_id, ['/bin/bash', '/root/docker.sh'])
             docker_put(args, test_id, local_source_fd.name, '/root/test.tgz')
             docker_exec(args, test_id, ['tar', 'oxzf', '/root/test.tgz', '-C', '/root'])
 
@@ -441,7 +458,7 @@ def delegate_remote(args, exclude, require, integration_targets):
             manage = ManagePosixCI(core_ci)
             manage.setup(python_version)
 
-            cmd = create_shell_command(['bash'])
+            cmd = create_shell_command(['sh'])
         else:
             manage = ManagePosixCI(core_ci)
             pwd = manage.setup(python_version)
@@ -462,7 +479,7 @@ def delegate_remote(args, exclude, require, integration_targets):
             cmd = generate_command(args, python_interpreter, os.path.join(ansible_root, 'bin'), content_root, options, exclude, require)
 
             if httptester_id:
-                cmd += ['--inject-httptester']
+                cmd += ['--inject-httptester', '--httptester-krb5-password', args.httptester_krb5_password]
 
             if isinstance(args, TestConfig):
                 if args.coverage and not args.coverage_label:

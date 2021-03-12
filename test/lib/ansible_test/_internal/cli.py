@@ -75,12 +75,12 @@ from .target import (
     walk_sanity_targets,
 )
 
-from .core_ci import (
-    AWS_ENDPOINTS,
-)
-
 from .cloud import (
     initialize_cloud_plugins,
+)
+
+from .core_ci import (
+    AnsibleCoreCI,
 )
 
 from .data import (
@@ -678,7 +678,7 @@ def key_value(argparse, value):  # type: (argparse_module, str) -> t.Tuple[str, 
     return parts[0], parts[1]
 
 
-# noinspection PyProtectedMember
+# noinspection PyProtectedMember,PyUnresolvedReferences
 def add_coverage_analyze(coverage_subparsers, coverage_common):  # type: (argparse_module._SubParsersAction, argparse_module.ArgumentParser) -> None
     """Add the `coverage analyze` subcommand."""
     analyze = coverage_subparsers.add_parser(
@@ -924,7 +924,6 @@ def add_environments(parser, isolated_delegation=True):
             remote=None,
             remote_stage=None,
             remote_provider=None,
-            remote_aws_region=None,
             remote_terminate=None,
             remote_endpoint=None,
             python_interpreter=None,
@@ -954,18 +953,12 @@ def add_environments(parser, isolated_delegation=True):
     remote.add_argument('--remote-provider',
                         metavar='PROVIDER',
                         help='remote provider to use: %(choices)s',
-                        choices=['default', 'aws', 'azure', 'parallels', 'ibmvpc', 'ibmps'],
+                        choices=['default'] + sorted(AnsibleCoreCI.PROVIDERS.keys()),
                         default='default')
 
     remote.add_argument('--remote-endpoint',
                         metavar='ENDPOINT',
                         help='remote provisioning endpoint to use (default: auto)',
-                        default=None)
-
-    remote.add_argument('--remote-aws-region',
-                        metavar='REGION',
-                        help='remote aws region to use: %(choices)s (default: auto)',
-                        choices=sorted(AWS_ENDPOINTS),
                         default=None)
 
     remote.add_argument('--remote-terminate',
@@ -993,6 +986,9 @@ def add_extra_coverage_options(parser):
                         action='store_true',
                         help='generate empty report of all python/powershell source files')
 
+    parser.add_argument('--export',
+                        help='directory to export combined coverage files to')
+
 
 def add_httptester_options(parser, argparse):
     """
@@ -1003,7 +999,7 @@ def add_httptester_options(parser, argparse):
 
     group.add_argument('--httptester',
                        metavar='IMAGE',
-                       default='quay.io/ansible/http-test-container:1.0.0',
+                       default='quay.io/ansible/http-test-container:1.3.0',
                        help='docker image to use for the httptester container')
 
     group.add_argument('--disable-httptester',
@@ -1014,6 +1010,9 @@ def add_httptester_options(parser, argparse):
 
     parser.add_argument('--inject-httptester',
                         action='store_true',
+                        help=argparse.SUPPRESS)  # internal use only
+
+    parser.add_argument('--httptester-krb5-password',
                         help=argparse.SUPPRESS)  # internal use only
 
 
@@ -1056,6 +1055,9 @@ def add_extra_docker_options(parser, integration=True):
     docker.add_argument('--docker-privileged',
                         action='store_true',
                         help='run docker container in privileged mode')
+
+    docker.add_argument('--docker-network',
+                        help='run using the specified docker network')
 
     # noinspection PyTypeChecker
     docker.add_argument('--docker-memory',
